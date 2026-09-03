@@ -1,0 +1,206 @@
+################################################################################
+##### SCRIPT SALAIRES : RENDEMENT MENSUEL SUR POPULATIONS APPARIEES ############
+################################################################################
+
+library(tidyverse)
+library(arrow)
+library(duckdb)
+library(writexl)
+
+# -----------------------------------------------------------------------------
+# 0. INITIALISATION ET CONNEXION
+# -----------------------------------------------------------------------------
+dir_tmp       <- "C:/Users/Public/Documents/Salma_CEA/duckdb_temp"
+dir_apparie   <- "C:/Users/Public/Documents/Salma_CEA/Etude_typeboulle/lt/"
+dir_champ     <- "C:/Users/Public/Documents/Salma_CEA/Extension_DARES/"
+export_path   <- "C:/Users/Public/Documents/Salma_CEA/Extension_DARES/resultats/"
+
+if(!dir.exists(export_path)) dir.create(export_path, recursive = TRUE)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = file.path(dir_tmp, "midas_salaires_appariement.duckdb"))
+dbExecute(con, "PRAGMA memory_limit='35GB';")
+dbExecute(con, "PRAGMA threads=8;")
+
+
+# -----------------------------------------------------------------------------
+# 1. IMPORT DES DONNEES ET CREATION DE LA COHORTE APPARIEE
+# -----------------------------------------------------------------------------
+
+# Table appariée (issue du script MatchIt)
+df_apparie <- open_dataset(file.path(dir_apparie, "echantillon_apparie_2019.parquet"))
+duckdb_register_arrow(con, "df_apparie_arrow", df_apparie)
+
+# Table initiale (pour récupérer date_deb_der_CTT et date_fin_der_CTT)
+champ <- open_dataset(file.path(dir_champ, "champ_retour_emploi_fdc2019_groupes.parquet")) %>% 
+  filter(decision_dal == "01", type_dal %in% c("01", "02", "03"))
+duckdb_register_arrow(con, "champ_brut_arrow", champ)
+
+# Jointure pour créer la cohorte de base avec les dates de contrats
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE cohortes_appariees AS
+  SELECT DISTINCT 
+    a.id_midas, 
+    a.deb_mois, 
+    CASE WHEN a.traite = 1 THEN 'RCI_apparies' ELSE 'Temoins_CDI_hors_RC' END AS groupe,
+    c.date_deb_der_CTT,
+    c.date_fin_der_CTT
+  FROM df_apparie_arrow a
+  LEFT JOIN champ_brut_arrow c 
+    ON a.id_midas = c.id_midas AND a.deb_mois = c.deb_mois
+")
+
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE cohortes_ids AS
+  SELECT DISTINCT id_midas FROM cohortes_appariees
+")
+
+
+# -----------------------------------------------------------------------------
+# 2. EXTRACTION DES CONTRATS MMO AVEC SALAIRE
+# -----------------------------------------------------------------------------
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE contrats AS
+  SELECT
+    m.id_midas,
+    TRY_CAST(m.DebutCTT AS DATE) AS debut,
+    TRY_CAST(m.FinCTT AS DATE)   AS fin,
+    
+    CASE 
+      WHEN TRY_CAST(m.salaire_base_mois_complet AS INTEGER) = 0 THEN 
+        (m.salaire_base / (date_diff('day', TRY_CAST(m.DebutCTT AS DATE), TRY_CAST(m.FinCTT AS DATE)) + 1)) * 30.42
+      ELSE 
+        m.salaire_base 
+    END AS salaire_base
+    
+  FROM read_parquet([
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2019_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2020_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2021_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2022_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2023_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2024_M8.parquet',
+    '//casd.fr/casdfs/Projets/UNEDIC0/Data/MIDAS_MIDAS_2026T1/MMO/MMO_2_2025_M8.parquet'
+  ], union_by_name = true) m
+  WHERE m.id_midas IN (SELECT id_midas FROM cohortes_ids)
+    AND TRY_CAST(m.Quali_Salaire_Base AS INTEGER) = 7
+    AND m.salaire_base > 0
+    AND TRY_CAST(m.DebutCTT AS DATE) IS NOT NULL
+    AND TRY_CAST(m.FinCTT AS DATE) IS NOT NULL
+")
+
+
+# -----------------------------------------------------------------------------
+# 3. SALAIRE DE REFERENCE (APPARIEMENT CONTRAT INITIAL)
+# -----------------------------------------------------------------------------
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE appariement_ref AS
+  SELECT 
+    c.id_midas, 
+    c.deb_mois, 
+    k.salaire_base,
+    CASE WHEN (k.debut = c.date_deb_der_CTT AND k.fin = c.date_fin_der_CTT) THEN 1 ELSE 0 END AS est_parfait,
+    k.fin AS date_fin_contrat,
+    date_diff('day', k.debut, k.fin) AS duree_contrat
+  FROM cohortes_appariees c
+  JOIN contrats k ON c.id_midas = k.id_midas
+  WHERE k.fin IS NOT NULL
+    AND date_trunc('month', k.fin) <= c.deb_mois
+")
+
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE salaire_ref AS
+  SELECT id_midas, deb_mois, salaire_base AS salaire_ref, est_parfait
+  FROM appariement_ref
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY id_midas, deb_mois
+    ORDER BY est_parfait DESC, date_fin_contrat DESC, duree_contrat DESC
+  ) = 1
+")
+
+dbExecute(con, "DROP TABLE appariement_ref")
+
+
+# -----------------------------------------------------------------------------
+# 4. PANEL 72 MOIS ET CALCUL DU RENDEMENT
+# -----------------------------------------------------------------------------
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE contrats_valides AS
+  SELECT 
+    id_midas,
+    salaire_base,
+    date_trunc('month', debut) AS mois_debut,
+    COALESCE(date_trunc('month', fin), CAST('2099-12-01' AS DATE)) AS mois_fin
+  FROM contrats
+")
+
+dbExecute(con, "
+  CREATE OR REPLACE TEMP TABLE panel_salaires AS
+  
+  WITH grille AS (
+    SELECT c.id_midas, c.deb_mois, c.groupe, s.salaire_ref, h.h,
+           c.deb_mois + to_months(CAST(h.h AS INTEGER)) AS mois_obs
+    FROM cohortes_appariees c
+    JOIN salaire_ref s ON c.id_midas = s.id_midas AND c.deb_mois = s.deb_mois
+    CROSS JOIN (SELECT unnest(generate_series(1, 72)) AS h) h
+  )
+  
+  SELECT
+    g.id_midas, g.deb_mois, g.groupe, g.h, g.salaire_ref,
+    MAX(k.salaire_base)                 AS salaire_mois,
+    MAX(k.salaire_base) / g.salaire_ref AS rendement
+  FROM grille g
+  LEFT JOIN contrats_valides k 
+    ON  k.id_midas = g.id_midas 
+    AND k.mois_debut <= g.mois_obs 
+    AND k.mois_fin >= g.mois_obs
+    AND k.mois_fin > g.deb_mois
+  GROUP BY g.id_midas, g.deb_mois, g.groupe, g.h, g.salaire_ref
+")
+
+dbExecute(con, "DROP TABLE contrats_valides")
+
+
+# -----------------------------------------------------------------------------
+# 5. RESULTATS STATISTIQUES
+# -----------------------------------------------------------------------------
+resultats_salaires_apparies <- dbGetQuery(con, "
+  SELECT groupe, h,
+    COUNT(*)                       AS effectif,
+    MEDIAN(rendement)              AS rendement_median,
+    AVG(rendement)                 AS rendement_moyen,
+    QUANTILE_CONT(rendement, 0.25) AS rendement_p25,
+    QUANTILE_CONT(rendement, 0.75) AS rendement_p75,
+    100.0 * AVG(CASE WHEN rendement >= 1 THEN 1 ELSE 0 END) AS part_salaire_retrouve
+  FROM panel_salaires
+  WHERE salaire_mois IS NOT NULL
+    AND rendement BETWEEN 0.1 AND 10
+  GROUP BY groupe, h
+  ORDER BY groupe, h
+") %>%
+  mutate(
+    h = as.integer(h),
+    groupe_lbl = factor(case_when(
+      groupe == "RCI_apparies"        ~ "1. Traités (Rupture Conventionnelle)",
+      groupe == "Temoins_CDI_hors_RC" ~ "2. Témoins (Autres motifs de fin CDI)"
+    ), levels = c("1. Traités (Rupture Conventionnelle)", 
+                  "2. Témoins (Autres motifs de fin CDI)"))
+  ) %>%
+  arrange(groupe_lbl, h)
+
+
+# -----------------------------------------------------------------------------
+# 6. EXPORT ET NETTOYAGE
+# -----------------------------------------------------------------------------
+write_xlsx(
+  list("Rendement_Apparie" = resultats_salaires_apparies), 
+  path = file.path(export_path, "Resultats_Salaires_Apparies_0109.xlsx")
+)
+
+# Fermeture propre de la base
+dbDisconnect(con, shutdown = TRUE)
+file.remove(file.path(dir_tmp, "midas_salaires_appariement.duckdb"))
+if(file.exists(file.path(dir_tmp, "midas_salaires_appariement.duckdb.wal"))) {
+  file.remove(file.path(dir_tmp, "midas_salaires_appariement.duckdb.wal"))
+}
+
+print("Traitement terminé : Résultats exportés avec succès.")
