@@ -127,7 +127,7 @@ df_apparie <- map_dfr(resultats, function(r) {
 
 bilan_pertes_global <- tibble(
   Statut = c("1.RCI cibles (Avant appariement)",
-             "2.RCI appariés (Après appariement)",
+             "2.RCI appariÃ©s (AprÃ¨s appariement)",
              "3.RCI perdus"),
   Effectif=c(
     sum(df_pop$traite==1),
