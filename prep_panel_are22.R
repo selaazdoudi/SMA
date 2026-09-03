@@ -62,7 +62,7 @@ champ_base_lazy <- tbl(con, "champ_22") %>%
   window_order(desc(KROD3), desc(log_sjr), deb_mois) %>%
   filter(row_number() == 1) %>%
   ungroup() %>%
-  # Identifiant d'EPISODE : un individu peut avoir plusieurs fins de contrat (rarissime en réalité)
+  # Identifiant d'EPISODE : un individu peut avoir plusieurs fins de contrat (rarissime en rÃ©alitÃ©)
   mutate(id_spell = paste0(id_midas, "_", as.character(date_fin_der_CTT)))
 
 dbExecute(con, "DROP TABLE IF EXISTS champ_base;")
