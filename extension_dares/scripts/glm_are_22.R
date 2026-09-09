@@ -18,21 +18,17 @@ export_path  <- "C:/Users/Public/Documents/Salma_CEA/Extension_DARES/resultats"
 if (!dir.exists(export_path)) dir.create(export_path, recursive = TRUE)
 
 # 2. Chargement et préparation des données
-# On prépare les facteurs et on définit la variable d'intérêt (équivalent de rupco)
+# On prépare les facteurs et on définit la variable d'intérêt 
 df <- read_parquet(chemin_panel) %>% 
   mutate(
     # Transformation en facteurs
     across(c(SEXE, niv_dip, qualif_classe, naf_64, duree_cat), as.factor),
-    h_fac = factor(h, levels = 1:36),
-    
-    # Création d'une variable binaire d'intérêt (à adapter selon vos vrais groupes)
-    # Par exemple, si groupe "1" est votre population cible :
-    est_traite = as.integer(groupe == "1") 
+    h_fac = factor(h, levels = 1:36)
   )
 
 # 3. Paramétrage des modèles
 # Variables explicatives du modèle (contrôle + variable d'intérêt)
-termes_exp <- c("est_traite", "SEXE", "age_ouv_droit", "niv_dip", 
+termes_exp <- c("rupco", "SEXE", "age_ouv_droit", "niv_dip", 
                 "qualif_classe", "duree_cat", "log_sjr", "islr", "naf_64")
 
 fm_salarie <- reformulate(termes_exp, response = "y_salarie")
@@ -72,7 +68,7 @@ for(i in 1:36) {
   coefs_list_sal[[i]] <- tidy(mod_sal) %>% 
     mutate(horizon = i, modele = "emploi_salarie")
   
-  # Prédictions et contrefactuel (est_traite = 0)
+  # Prédictions et contrefactuel (rupco = 0)
   eta_sal <- predict(mod_sal, newdata = dfi, type = "link")
   b_t_sal <- unname(coef(mod_sal)[["est_traite"]])
   p_hat_sal_ctrl <- plogis(eta_sal - b_t_sal * as.numeric(dfi$est_traite))
@@ -88,10 +84,10 @@ for(i in 1:36) {
   coefs_list_dur[[i]] <- tidy(mod_dur) %>% 
     mutate(horizon = i, modele = "emploi_durable")
   
-  # Prédictions et contrefactuel (est_traite = 0)
+  # Prédictions et contrefactuel (rupco = 0)
   eta_dur <- predict(mod_dur, newdata = dfi, type = "link")
-  b_t_dur <- unname(coef(mod_dur)[["est_traite"]])
-  p_hat_dur_ctrl <- plogis(eta_dur - b_t_dur * as.numeric(dfi$est_traite))
+  b_t_dur <- unname(coef(mod_dur)[["rupco"]])
+  p_hat_dur_ctrl <- plogis(eta_dur - b_t_dur * as.numeric(dfi$rupco))
   
   ###### C. Intégration et Agrégation ######
   dfi <- dfi %>% 
@@ -115,7 +111,7 @@ for(i in 1:36) {
   
   # Agrégation ciblée (Uniquement pour le groupe traité)
   agg_traite <- dfi %>% 
-    filter(est_traite == 1) %>% 
+    filter(rupco == 1) %>% 
     group_by(M, coh_lbl) %>% 
     summarise(
       n = n(),
