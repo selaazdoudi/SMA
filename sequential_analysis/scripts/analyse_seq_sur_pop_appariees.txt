@@ -1,0 +1,467 @@
+################################################################################
+##### SCRIPT 3ter : SEQUENCES COMPARATIVES RCI / TEMOINS (COHORTES 2019) #######
+################################################################################
+# Suite du script d'appariement. Trois changements par rapport a la version
+# precedente (script 3bis) :
+#   1. tirage dans l'echantillon APPARIE, les deux groupes, par PAIRE entiere
+#   2. etat "activite non salariee" recode : il etait mathematiquement
+#      inatteignable dans la version precedente (voir bloc 3)
+#   3. typologie construite sur les deux groupes REUNIS, puis croisee avec le
+#      statut de traitement -> c'est la sortie principale
+################################################################################
+
+rm(list = ls())
+gc()
+
+library(tidyverse)
+library(arrow)
+library(TraMineR)
+library(TraMineRextras)
+library(WeightedCluster)
+library(nnet)
+
+dir_out  <- "C:/Users/Public/Documents/Salma_CEA/Etude_typeboulle/lt/"
+dir_res  <- file.path(dir_out, "resultats")
+if (!dir.exists(dir_res)) dir.create(dir_res, recursive = TRUE)
+
+################################################################################
+##### PARAMETRES ###############################################################
+################################################################################
+
+H_MIN_SEQ   <- -6    # debut du chronogramme descriptif (pre-periode courte)
+H_MAX       <- 72    # dernier horizon observe pour toutes les cohortes 2019
+H_DEB_CLUST <- 1     # la typologie ne porte que sur le POST
+
+N_PAIRES    <- 5000  # 5 000 paires = 10 000 sequences (matrice OM ~ 800 Mo)
+GRAINE      <- 2019
+
+# Choix de la mesure d'activite non salariee.
+#   y_ns_max : ANS ouverte au sens PAF, NON conditionnee a l'indemnisation
+#   y_ns_min : ANS observee seulement pendant l'indemnisation
+# ATTENTION : y_ns_min => indemnise == 1 par construction (script 1). Utilisee
+# comme etat de sequence, elle est TOUJOURS ecrasee par CHOM_IND ou EMP_*.
+# On prend donc y_ns_max par defaut, et y_ns_min en robustesse (bloc 11).
+VAR_ANS <- "y_ns_max"
+
+# f_retraite est actuellement inutilisable : la jointure du bloc "presence_retraite"
+# du script 1 s'ecrit  ON c.id_midas = c.id_midas  (au lieu de = p.id_midas),
+# ce qui produit un produit cartesien et met y_retraite a 1 pour tout le monde.
+# Tant que ce n'est pas corrige, on n'utilise pas cet etat.
+UTILISER_RETRAITE <- FALSE
+
+# Secret statistique CASD : aucune sortie agregee sur des effectifs < 11
+SEUIL_SECRET <- 11
+
+################################################################################
+##### 1. CHARGEMENT DE L'ECHANTILLON APPARIE ###################################
+################################################################################
+
+apparie <- read_parquet(file.path(dir_out, "echantillon_apparie_2019.parquet")) %>%
+  select(id_spell, id_midas, paire, traite, groupe, deb_mois,
+         SEXE, qualif_classe, niv_dip, duree_cat,
+         age_fin_ctt_redresse, log_sjr)
+
+# Controle : chaque paire doit contenir exactement 1 traite et 1 temoin
+verif_paires <- apparie %>%
+  group_by(paire) %>%
+  summarise(n = n(), n_traites = sum(traite), .groups = "drop")
+
+cat("\nPaires mal formees :", sum(verif_paires$n != 2 | verif_paires$n_traites != 1), "\n")
+stopifnot(all(verif_paires$n == 2 & verif_paires$n_traites == 1))
+
+cat("Nombre de paires appariees :", nrow(verif_paires), "\n")
+
+################################################################################
+##### 2. TIRAGE PAR PAIRE ######################################################
+################################################################################
+# On tire des PAIRES entieres, pas des individus : les deux groupes restent
+# exactement equilibres et la structure d'appariement est preservee pour les
+# tests du bloc 8.
+
+set.seed(GRAINE)
+
+paires_tirees <- verif_paires %>%
+  slice_sample(n = min(N_PAIRES, nrow(verif_paires))) %>%
+  pull(paire)
+
+ech <- apparie %>% filter(paire %in% paires_tirees)
+
+cat("Paires tirees :", length(paires_tirees),
+    "| sequences :", nrow(ech),
+    "| dont traites :", sum(ech$traite), "\n")
+
+################################################################################
+##### 3. CONSTRUCTION DES ETATS ################################################
+################################################################################
+# Ordre des branches : l'ANS passe AVANT le chomage indemnise et avant l'emploi
+# salarie, sinon elle est systematiquement absorbee.
+#
+# Trois etats ANS pour distinguer des situations economiquement differentes :
+#   ANS_SAL    : activite non salariee + emploi salarie le meme mois
+#   ANS_INDEM  : activite non salariee + indemnisation (creation aidee, ARE/ARCE)
+#   ANS_SEULE  : activite non salariee sans indemnisation ni salariat
+# Leur somme = stock de non-salaries. C'est le resultat principal du DiD, il
+# doit etre visible sur le chronogramme.
+
+panel_lazy <- open_dataset(file.path(dir_out, "panel_pour_appariement_2019.parquet"))
+
+panel_ech <- panel_lazy %>%
+  select(id_spell, h, y_salarie, y_ns_min, y_ns_max,
+         f_indemnise, f_minima, f_retraite) %>%
+  filter(h >= H_MIN_SEQ, h <= H_MAX) %>%
+  collect() %>%
+  inner_join(ech %>% select(id_spell, paire, traite), by = "id_spell")
+
+construire_etats <- function(df, var_ans) {
+  df %>%
+    mutate(
+      y_ans = .data[[var_ans]],
+      etat_seq = case_when(
+        y_ans == 1 & y_salarie == 1                          ~ "ANS_SAL",
+        y_ans == 1 & f_indemnise == 1                        ~ "ANS_INDEM",
+        y_ans == 1                                           ~ "ANS_SEULE",
+        y_salarie == 1 & (f_indemnise == 1 | f_minima == 1)  ~ "EMP_AIDES",
+        y_salarie == 1                                       ~ "EMP_SAL",
+        f_indemnise == 1                                     ~ "CHOM_IND",
+        f_minima == 1                                        ~ "AUTRE_MINIMA",
+        UTILISER_RETRAITE & f_retraite == 1                  ~ "AUTRE_RETRAITE",
+        TRUE                                                 ~ "NON_OBSERVE"
+      )
+    )
+}
+
+panel_etats <- construire_etats(panel_ech, VAR_ANS)
+
+# Controle : aucun etat de l'alphabet ne doit etre vide.
+cat("\nEffectifs par etat (mois-personnes) :\n")
+print(panel_etats %>% count(etat_seq, sort = TRUE))
+
+################################################################################
+##### 4. OBJETS SEQUENCE #######################################################
+################################################################################
+
+alphabet_etats <- c("EMP_SAL", "EMP_AIDES",
+                    "ANS_SAL", "ANS_INDEM", "ANS_SEULE",
+                    "CHOM_IND", "AUTRE_MINIMA", "NON_OBSERVE")
+labels_etats   <- c("Emploi salarie", "Emploi salarie avec aides",
+                    "Non salarie + salarie", "Non salarie indemnise",
+                    "Non salarie seul",
+                    "Chomage indemnise", "Minima sociaux", "Non observe")
+palette_couleurs <- c("#1A9850", "#A6D96A",
+                      "#8C510A", "#D73027", "#F46D43",
+                      "#4393C3", "#984EA3", "#E0E0E0")
+
+if (UTILISER_RETRAITE) {
+  alphabet_etats   <- append(alphabet_etats, "AUTRE_RETRAITE", after = 7)
+  labels_etats     <- append(labels_etats, "Retraite", after = 7)
+  palette_couleurs <- append(palette_couleurs, "#4D4D4D", after = 7)
+}
+
+# Etats effectivement presents (seqdef echoue sur un niveau d'alphabet vide)
+etats_presents   <- intersect(alphabet_etats, unique(panel_etats$etat_seq))
+idx              <- match(etats_presents, alphabet_etats)
+labels_presents  <- labels_etats[idx]
+couleurs_presentes <- palette_couleurs[idx]
+
+if (length(etats_presents) < length(alphabet_etats)) {
+  message("Etats absents de l'echantillon : ",
+          paste(setdiff(alphabet_etats, etats_presents), collapse = ", "))
+}
+
+faire_seq <- function(df, h_deb, h_fin) {
+  wide <- df %>%
+    filter(h >= h_deb, h <= h_fin) %>%
+    select(id_spell, h, etat_seq) %>%
+    arrange(id_spell, h) %>%
+    pivot_wider(names_from = h, values_from = etat_seq,
+                names_prefix = "m", names_sort = TRUE)
+
+  stopifnot(!any(is.na(wide)))
+
+  cols <- paste0("m", h_deb:h_fin)
+  obj  <- seqdef(wide, var = cols,
+                 alphabet = etats_presents,
+                 labels   = labels_presents,
+                 cpal     = couleurs_presentes,
+                 id       = wide$id_spell,
+                 xtstep   = 6)
+  list(seq = obj, ids = wide$id_spell)
+}
+
+# (a) sequences pour la TYPOLOGIE : post-rupture uniquement
+s_post <- faire_seq(panel_etats, H_DEB_CLUST, H_MAX)
+seq_post <- s_post$seq
+
+# (b) sequences pour le CHRONOGRAMME descriptif : pre + post
+#     h = 0 est un mois de transition (fin de contrat en cours de mois), on le
+#     garde pour la contiguite mais on le signale en note de lecture.
+s_tot <- faire_seq(panel_etats, H_MIN_SEQ, H_MAX)
+seq_tot <- s_tot$seq
+
+# Table de correspondance id_spell -> groupe, dans l'ordre des sequences
+info_post <- tibble(id_spell = s_post$ids) %>%
+  left_join(ech %>% select(id_spell, paire, traite, groupe,
+                           SEXE, qualif_classe, niv_dip, duree_cat,
+                           age_fin_ctt_redresse, log_sjr),
+            by = "id_spell")
+stopifnot(nrow(info_post) == nrow(seq_post))
+
+info_tot <- tibble(id_spell = s_tot$ids) %>%
+  left_join(ech %>% select(id_spell, traite), by = "id_spell")
+
+grp_lbl_tot  <- factor(info_tot$traite,  levels = c(1, 0),
+                       labels = c("Rupture conventionnelle", "Fin de CDI hors RC"))
+grp_lbl_post <- factor(info_post$traite, levels = c(1, 0),
+                       labels = c("Rupture conventionnelle", "Fin de CDI hors RC"))
+
+################################################################################
+##### 5. CHRONOGRAMMES COMPARES ################################################
+################################################################################
+# FIGURE 1 : la comparaison des deux chronogrammes est la sortie la plus
+# lisible de tout l'exercice. C'est la qu'on doit voir (i) la bande ANS presente
+# chez les RCI et pas chez les temoins, (ii) le decrochage d'indemnisation
+# autour de m30 et son eventuel decalage entre groupes.
+
+png(file.path(dir_res, "fig1_chronogramme_compare.png"),
+    width = 2400, height = 1100, res = 180)
+seqdplot(seq_tot, group = grp_lbl_tot, border = NA,
+         with.legend = "right", cex.legend = 0.75,
+         main = NULL,
+         xlab = "Mois depuis la fin de contrat (h = 0 : mois de la rupture)")
+dev.off()
+
+# FIGURE 2 : temps moyen passe dans chaque etat, par groupe
+png(file.path(dir_res, "fig2_temps_moyen_compare.png"),
+    width = 2400, height = 1000, res = 180)
+seqmtplot(seq_post, group = grp_lbl_post, with.legend = "right", cex.legend = 0.75)
+dev.off()
+
+# Version chiffree du temps moyen (exportable)
+temps_moyen <- seqmeant(seq_post, group = grp_lbl_post) %>%
+  as.data.frame() %>%
+  rownames_to_column("etat")
+write_csv(temps_moyen, file.path(dir_res, "temps_moyen_par_etat_groupe.csv"))
+
+# Entropie transversale : mesure de dispersion des situations a chaque mois
+png(file.path(dir_res, "fig3_entropie_compare.png"),
+    width = 1800, height = 1000, res = 180)
+seqHtplot(seq_post, group = grp_lbl_post,
+          main = NULL, xlab = "Mois depuis la fin de contrat")
+dev.off()
+
+################################################################################
+##### 6. DISTANCES ET TYPOLOGIE COMMUNE ########################################
+################################################################################
+# Point de methode : la CAH tourne sur les DEUX groupes reunis. Deux typologies
+# construites separement produiraient des classes non comparables, et le
+# croisement du bloc 8 n'aurait aucun sens.
+
+METHODE_COUTS <- "TRATE"   # "CONSTANT" en robustesse (bloc 11)
+
+couts <- seqsubm(seq_post, method = METHODE_COUTS,
+                 cval = if (METHODE_COUTS == "CONSTANT") 2 else NULL)
+diss  <- seqdist(seq_post, method = "OM", indel = 1, sm = couts)
+
+arbre <- hclust(as.dist(diss), method = "ward.D2")
+
+# Choix de k sur indices, pas a l'oeil
+qualite <- as.clustrange(arbre, diss = diss, ncluster = 10)
+print(summary(qualite, max.rank = 5))
+
+png(file.path(dir_res, "fig4_indices_qualite_k.png"),
+    width = 1800, height = 1000, res = 180)
+plot(qualite, stat = c("ASW", "HC", "PBC"), norm = "zscore")
+dev.off()
+
+indices_k <- as.data.frame(qualite$stats) %>% rownames_to_column("k")
+write_csv(indices_k, file.path(dir_res, "indices_qualite_clustering.csv"))
+
+# k retenu : ASW maximal, sauf decision contraire justifiee
+K <- which.max(qualite$stats[, "ASW"]) + 1
+cat("\nk retenu (ASW maximal) :", K, "\n")
+# K <- 4   # decommenter pour forcer une valeur apres lecture des indices
+
+classe <- cutree(arbre, k = K)
+info_post$classe <- factor(classe, levels = 1:K,
+                           labels = paste0("Classe ", 1:K))
+
+rm(diss); gc()
+
+################################################################################
+##### 7. DESCRIPTION DES CLASSES ###############################################
+################################################################################
+
+png(file.path(dir_res, "fig5_chronogramme_par_classe.png"),
+    width = 2400, height = 1600, res = 180)
+seqdplot(seq_post, group = info_post$classe, border = NA,
+         with.legend = "right", cex.legend = 0.7)
+dev.off()
+
+png(file.path(dir_res, "fig6_temps_moyen_par_classe.png"),
+    width = 2400, height = 1600, res = 180)
+seqmtplot(seq_post, group = info_post$classe, with.legend = "right", cex.legend = 0.7)
+dev.off()
+
+# Sequences representatives : utile pour nommer les classes
+png(file.path(dir_res, "fig7_sequences_representatives.png"),
+    width = 2400, height = 1600, res = 180)
+seqrplot(seq_post, group = info_post$classe, border = NA,
+         with.legend = "right", cex.legend = 0.7)
+dev.off()
+
+profil_classes <- info_post %>%
+  group_by(classe) %>%
+  summarise(
+    n            = n(),
+    pct_effectif = 100 * n() / nrow(info_post),
+    age_moyen    = mean(age_fin_ctt_redresse, na.rm = TRUE),
+    pct_femmes   = 100 * mean(SEXE == "2", na.rm = TRUE),
+    pct_cadres   = 100 * mean(qualif_classe == "cadre", na.rm = TRUE),
+    pct_sup      = 100 * mean(niv_dip == "superieur", na.rm = TRUE),
+    log_sjr_moy  = mean(log_sjr, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(profil_classes)
+write_csv(profil_classes, file.path(dir_res, "profil_classes_communes.csv"))
+
+################################################################################
+##### 8. SORTIE PRINCIPALE : CLASSE x TRAITEMENT ###############################
+################################################################################
+# Les paires etant 1:1, on teste la difference de composition PAR PAIRE, ce qui
+# tient compte de l'appariement (equivalent apparie d'une difference de
+# proportions ; version multi-classes du test de McNemar).
+
+repartition <- info_post %>%
+  count(traite, classe) %>%
+  group_by(traite) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  mutate(groupe = if_else(traite == 1, "RCI", "Temoins"))
+
+tableau_croise <- repartition %>%
+  select(groupe, classe, n, pct) %>%
+  pivot_wider(names_from = groupe, values_from = c(n, pct))
+
+# Difference appariee, classe par classe
+diff_appariee <- map_dfr(levels(info_post$classe), function(cl) {
+  par_paire <- info_post %>%
+    mutate(ind = as.integer(classe == cl)) %>%
+    select(paire, traite, ind) %>%
+    pivot_wider(names_from = traite, values_from = ind,
+                names_prefix = "t") %>%
+    filter(!is.na(t1), !is.na(t0)) %>%
+    mutate(d = t1 - t0)
+
+  n_p <- nrow(par_paire)
+  m   <- mean(par_paire$d)
+  se  <- sd(par_paire$d) / sqrt(n_p)
+
+  tibble(
+    classe      = cl,
+    n_paires    = n_p,
+    pct_RCI     = 100 * mean(par_paire$t1),
+    pct_temoins = 100 * mean(par_paire$t0),
+    diff_pp     = 100 * m,
+    ic_bas_pp   = 100 * (m - 1.96 * se),
+    ic_haut_pp  = 100 * (m + 1.96 * se),
+    p_value     = 2 * pnorm(-abs(m / se))
+  )
+})
+
+cat("\n=== SORTIE PRINCIPALE : composition des trajectoires ===\n")
+print(diff_appariee %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+write_csv(diff_appariee, file.path(dir_res, "diff_appariee_classes.csv"))
+write_csv(tableau_croise, file.path(dir_res, "tableau_croise_classe_groupe.csv"))
+
+# Figure : parts de classes par groupe avec IC
+fig_parts <- diff_appariee %>%
+  select(classe, pct_RCI, pct_temoins) %>%
+  pivot_longer(-classe, names_to = "grp", values_to = "pct") %>%
+  mutate(grp = if_else(grp == "pct_RCI", "Rupture conventionnelle",
+                       "Fin de CDI hors RC")) %>%
+  ggplot(aes(x = classe, y = pct, fill = grp)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  labs(x = NULL, y = "Part des trajectoires (%)", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(dir_res, "fig8_parts_classes_par_groupe.png"),
+       fig_parts, width = 8, height = 5, dpi = 300)
+
+################################################################################
+##### 9. MULTINOMIALE ##########################################################
+################################################################################
+# Complement chiffre : effet de la RC sur l'appartenance a chaque classe, net
+# des caracteristiques. Sur echantillon apparie l'ajustement est redondant,
+# il sert de controle de coherence.
+
+df_mn <- info_post %>%
+  mutate(across(c(SEXE, qualif_classe, niv_dip, duree_cat), as.factor)) %>%
+  drop_na(classe, traite, SEXE, qualif_classe, niv_dip, age_fin_ctt_redresse)
+
+mod_mn <- multinom(classe ~ traite + SEXE + qualif_classe + niv_dip +
+                     age_fin_ctt_redresse + log_sjr,
+                   data = df_mn, trace = FALSE)
+
+coefs_mn <- broom::tidy(mod_mn, conf.int = TRUE) %>%
+  filter(term == "traite") %>%
+  mutate(odds_ratio = exp(estimate))
+print(coefs_mn)
+write_csv(coefs_mn, file.path(dir_res, "multinomiale_traite.csv"))
+
+################################################################################
+##### 10. CONTROLE DU SECRET STATISTIQUE #######################################
+################################################################################
+
+controle_secret <- repartition %>%
+  filter(n < SEUIL_SECRET)
+
+if (nrow(controle_secret) > 0) {
+  warning("Cellules sous le seuil de secret statistique :")
+  print(controle_secret)
+} else {
+  cat("\nControle secret statistique : aucune cellule sous le seuil.\n")
+}
+
+################################################################################
+##### 11. ROBUSTESSES ##########################################################
+################################################################################
+# A relancer en modifiant les parametres du haut de script, puis a comparer :
+#
+#  (a) STABILITE DU TIRAGE
+#      GRAINE <- 1234, puis 5678. La repartition des classes par groupe
+#      (diff_appariee) doit etre stable a ~1 pp pres.
+#
+#  (b) COUTS DE SUBSTITUTION
+#      METHODE_COUTS <- "CONSTANT" (cval = 2). Si la typologie change de nature,
+#      le dire explicitement dans le papier.
+#
+#  (c) MESURE DE L'ANS
+#      VAR_ANS <- "y_ns_min". Attention : avec cette variable les etats ANS
+#      redeviennent quasi vides hors periode d'indemnisation. Sert uniquement a
+#      montrer l'ampleur de l'encadrement, pas comme specification principale.
+#
+#  (d) HORIZON
+#      H_MAX <- 36. Verifie que la typologie n'est pas pilotee par la seule
+#      seconde moitie de la fenetre.
+#
+# Boucle prete a l'emploi pour (a) :
+#
+# stabilite <- map_dfr(c(2019, 1234, 5678), function(g) {
+#   set.seed(g)
+#   p <- sample(verif_paires$paire, min(N_PAIRES, nrow(verif_paires)))
+#   # ... rejouer les blocs 3 a 8 sur ces paires ...
+#   diff_appariee %>% mutate(graine = g)
+# })
+
+################################################################################
+##### 12. EXPORT ###############################################################
+################################################################################
+
+write_parquet(
+  info_post %>% select(id_spell, paire, traite, groupe, classe),
+  file.path(dir_out, "classes_sequences_communes_2019.parquet")
+)
+
+cat("\nTermine. Sorties dans :", dir_res, "\n")
