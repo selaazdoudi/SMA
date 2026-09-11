@@ -1,0 +1,276 @@
+################################################################################
+##### SCRIPT COMPLET : SEQUENCES ET TYPOLOGIES SEPAREES (METHODE SEQHANDBOOK) ##
+################################################################################
+# Ce script reprend l'intégralité de votre pipeline analytique en l'épurant
+# (suppression des répétitions) et en y intégrant les bonnes pratiques du
+# manuel de Nicolas Robette (TraMineR / WeightedCluster) :
+#   1. Tirage par paires entières
+#   2. Construction et formatage des séquences
+#   3. Typologies séparées (RCI vs Témoins) avec consolidation PAM
+#   4. Description complète (Chronogrammes, Temps moyen, Séquences représentatives, 
+#      Entropie transversale et indicateurs de complexité)
+#   5. Modélisation multinomiale et exports propres
+################################################################################
+
+rm(list = ls())
+gc()
+
+library(tidyverse)
+library(arrow)
+library(TraMineR)
+library(TraMineRextras)
+library(WeightedCluster)
+library(nnet)
+
+dir_out <- "C:/Users/Public/Documents/Salma_CEA/Etude_typeboulle/lt/"
+dir_res <- file.path(dir_out, "resultats_separes_propre")
+if (!dir.exists(dir_res)) dir.create(dir_res, recursive = TRUE)
+
+# --- Fonction utilitaire pour éviter le code répétitif d'export graphique ---
+exporter_graphe <- function(nom_fichier, expression_graphique) {
+  png(file.path(dir_res, nom_fichier), width = 2400, height = 1600, res = 180)
+  eval(substitute(expression_graphique))
+  dev.off()
+}
+
+################################################################################
+##### 1. PARAMETRES ET CHARGEMENT DE L'ECHANTILLON #############################
+################################################################################
+
+H_MIN_SEQ <- -6 
+H_MAX     <- 72 
+H_DEB_CLUST <- 1 
+
+N_PAIRES  <- 5000 
+GRAINE    <- 2019
+
+VAR_ANS <- "y_ns_max"
+UTILISER_RETRAITE <- FALSE
+SEUIL_SECRET <- 11
+
+apparie <- read_parquet(file.path(dir_out, "echantillon_apparie_2019.parquet")) %>%
+  select(id_spell, id_midas, paire, traite, groupe, deb_mois,
+         SEXE, qualif_classe, niv_dip, duree_cat,
+         age_fin_ctt_redresse, log_sjr)
+
+verif_paires <- apparie %>%
+  group_by(paire) %>%
+  summarise(n = n(), n_traites = sum(traite), .groups = "drop")
+
+stopifnot(all(verif_paires$n == 2 & verif_paires$n_traites == 1))
+
+set.seed(GRAINE)
+paires_tirees <- verif_paires %>%
+  slice_sample(n = min(N_PAIRES, nrow(verif_paires))) %>%
+  pull(paire)
+
+ech <- apparie %>% filter(paire %in% paires_tirees)
+
+cat("Paires tirées :", length(paires_tirees),
+    "| séquences :", nrow(ech),
+    "| dont traités :", sum(ech$traite), "\n")
+
+################################################################################
+##### 2. CONSTRUCTION DES ETATS ################################################
+################################################################################
+
+panel_lazy <- open_dataset(file.path(dir_out, "panel_pour_appariement_2019.parquet"))
+
+panel_ech <- panel_lazy %>%
+  select(id_spell, h, y_salarie, y_ns_min, y_ns_max,
+         f_indemnise, f_minima, f_retraite) %>%
+  filter(h >= H_MIN_SEQ, h <= H_MAX) %>%
+  collect() %>%
+  inner_join(ech %>% select(id_spell, paire, traite), by = "id_spell")
+
+panel_etats <- panel_ech %>%
+  mutate(
+    y_ans = .data[[VAR_ANS]],
+    etat_seq = case_when(
+      y_ans == 1 & y_salarie == 1                        ~ "ANS_SAL",
+      y_ans == 1 & f_indemnise == 1                      ~ "ANS_INDEM",
+      y_ans == 1                                         ~ "ANS_SEULE",
+      y_salarie == 1 & (f_indemnise == 1 | f_minima == 1) ~ "EMP_AIDES",
+      y_salarie == 1                                     ~ "EMP_SAL",
+      f_indemnise == 1                                   ~ "CHOM_IND",
+      f_minima == 1                                      ~ "AUTRE_MINIMA",
+      UTILISER_RETRAITE & f_retraite == 1                ~ "AUTRE_RETRAITE",
+      TRUE                                               ~ "NON_OBSERVE"
+    )
+  )
+
+################################################################################
+##### 3. CREATION DES OBJETS SEQUENCES SEPARES #################################
+################################################################################
+
+alphabet_etats <- c("EMP_SAL", "EMP_AIDES", "ANS_SAL", "ANS_INDEM", "ANS_SEULE", "CHOM_IND", "AUTRE_MINIMA", "NON_OBSERVE")
+labels_etats   <- c("Emploi salarié", "Emploi salarié avec aides", "Non salarié + salarié", "Non salarié indemnisé", "Non salarié seul", "Chômage indemnisé", "Minima sociaux", "Non observé")
+palette_couleurs <- c("#1A9850", "#A6D96A", "#8C510A", "#D73027", "#F46D43", "#4393C3", "#984EA3", "#E0E0E0")
+
+etats_presents <- intersect(alphabet_etats, unique(panel_etats$etat_seq))
+idx <- match(etats_presents, alphabet_etats)
+labels_presents <- labels_etats[idx]
+couleurs_presentes <- palette_couleurs[idx]
+
+faire_seq <- function(df, h_deb, h_fin) {
+  wide <- df %>%
+    filter(h >= h_deb, h <= h_fin) %>%
+    select(id_spell, h, etat_seq) %>%
+    arrange(id_spell, h) %>%
+    pivot_wider(names_from = h, values_from = etat_seq, names_prefix = "m", names_sort = TRUE)
+
+  cols <- paste0("m", h_deb:h_fin)
+  seqdef(wide, var = cols, alphabet = etats_presents, labels = labels_presents, cpal = couleurs_presentes, id = wide$id_spell, xtstep = 6)
+}
+
+# Séquences post-rupture pour la typologie
+seq_post <- faire_seq(panel_etats, H_DEB_CLUST, H_MAX)
+info_post <- tibble(id_spell = rownames(seq_post)) %>% left_join(ech, by = "id_spell")
+
+# Séquences globales pour les chronogrammes comparatifs initiaux
+seq_tot <- faire_seq(panel_etats, H_MIN_SEQ, H_MAX)
+
+# Séparation RCI / Témoins
+seq_post_rci <- seq_post[info_post$traite == 1, ]
+info_post_rci <- info_post %>% filter(traite == 1)
+
+seq_post_tem <- seq_post[info_post$traite == 0, ]
+info_post_tem <- info_post %>% filter(traite == 0)
+
+# Chronogramme global comparatif initial
+grp_lbl_tot <- factor(ech$traite[match(rownames(seq_tot), ech$id_spell)], levels = c(1, 0), labels = c("Rupture conventionnelle", "Fin de CDI hors RC"))
+exporter_graphe("fig0_chronogramme_global.png", seqdplot(seq_tot, group = grp_lbl_tot, border = NA, with.legend = "right", xlab = "Mois depuis la fin de contrat"))
+
+################################################################################
+##### 4. TYPOLOGIES SEPAREES (OPTIMAL MATCHING + CAH + CONSOLIDATION PAM) ######
+################################################################################
+
+faire_typologie <- function(sequences, k_choisi, prefixe) {
+  cat("\nCalcul de la typologie pour :", prefixe, "\n")
+  
+  # Matrice de distances (OM avec coûts constants de type seqhandbook)
+  couts <- seqsubm(sequences, method = "CONSTANT", cval = 2)
+  diss  <- seqdist(sequences, method = "OM", indel = 1.5, sm = couts)
+  
+  # CAH de Ward
+  arbre <- hclust(as.dist(diss), method = "ward.D2")
+  part_cah <- cutree(arbre, k = k_choisi)
+  
+  # Consolidation par l'algorithme PAM (K-Medoids) pour optimiser le R2
+  part_pam <- wcKMedoids(diss, k = k_choisi, initialclust = part_cah, cluster.only = TRUE)
+  
+  # Formatage en facteur propre
+  facteur_classe <- factor(as.numeric(as.factor(part_pam)), levels = 1:k_choisi, labels = paste0(prefixe, "_Cl", 1:k_choisi))
+  
+  list(classe = facteur_classe, diss = diss)
+}
+
+# Définissez ici votre nombre de classes (par groupe) après observation des sauts d'inertie
+K_RCI <- 5
+K_TEM <- 5
+
+res_rci <- faire_typologie(seq_post_rci, k_choisi = K_RCI, prefixe = "RCI")
+info_post_rci$classe <- res_rci$classe
+diss_rci <- res_rci$diss
+
+res_tem <- faire_typologie(seq_post_tem, k_choisi = K_TEM, prefixe = "TEM")
+info_post_tem$classe <- res_tem$classe
+diss_tem <- res_tem$diss
+
+info_post_final <- bind_rows(info_post_rci, info_post_tem)
+
+################################################################################
+##### 5. DESCRIPTION COMPLETE DE LA TYPOLOGIE (METHODE SEQHANDBOOK) ############
+################################################################################
+
+decrire_classes <- function(seq_obj, vecteur_classes, diss_matrix, prefixe) {
+  cat("\nGénération des graphiques de description pour :", prefixe, "\n")
+  
+  # 1. Chronogrammes par classe
+  exporter_graphe(paste0("desc_", prefixe, "_1_chronogrammes.png"), 
+                  seqdplot(seq_obj, group = vecteur_classes, border = NA, with.legend = "right", main = paste(prefixe, "- Répartition des états")))
+  
+  # 2. Temps moyen passé dans chaque état
+  exporter_graphe(paste0("desc_", prefixe, "_2_temps_moyen.png"), 
+                  seqmtplot(seq_obj, group = vecteur_classes, with.legend = "right", main = paste(prefixe, "- Temps moyen par état")))
+  
+  # 3. Séquences représentatives
+  exporter_graphe(paste0("desc_", prefixe, "_3_seq_representatives.png"), 
+                  seqrplot(seq_obj, group = vecteur_classes, dist.matrix = diss_matrix, border = NA, coverage = 0.3, with.legend = "right", main = paste(prefixe, "- Séquences représentatives")))
+  
+  # 4. Entropie transversale (Incertitude au fil du temps)
+  exporter_graphe(paste0("desc_", prefixe, "_4_entropie.png"), 
+                  seqHtplot(seq_obj, group = vecteur_classes, main = paste(prefixe, "- Entropie transversale")))
+  
+  # 5. Calcul des indicateurs de complexité (Complexité et nombre de transitions)
+  complexite  <- seqici(seq_obj)
+  nb_episodes <- seqtransn(seq_obj) + 1
+  
+  stats_complexite <- tibble(
+    classe = vecteur_classes,
+    complexite = as.numeric(complexite),
+    nb_episodes = as.numeric(nb_episodes)
+  ) %>%
+    group_by(classe) %>%
+    summarise(
+      complexite_moyenne = mean(complexite, na.rm = TRUE),
+      nb_episodes_moyen = mean(nb_episodes, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  write_csv(stats_complexite, file.path(dir_res, paste0("desc_", prefixe, "_5_complexite.csv")))
+}
+
+# Application de la description pour chaque groupe
+decrire_classes(seq_post_rci, info_post_rci$classe, diss_rci, "RCI")
+decrire_classes(seq_post_tem, info_post_tem$classe, diss_tem, "TEMOINS")
+
+# Profils sociodémographiques croisés
+profil_classes <- info_post_final %>%
+  group_by(groupe, classe) %>%
+  summarise(
+    n = n(),
+    age_moyen = mean(age_fin_ctt_redresse, na.rm = TRUE),
+    pct_femmes = 100 * mean(SEXE == "2", na.rm = TRUE),
+    pct_cadres = 100 * mean(qualif_classe == "cadre", na.rm = TRUE),
+    pct_sup = 100 * mean(niv_dip == "superieur", na.rm = TRUE),
+    log_sjr_moy = mean(log_sjr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(groupe) %>%
+  mutate(pct_effectif_groupe = 100 * n / sum(n)) %>%
+  ungroup()
+
+write_csv(profil_classes, file.path(dir_res, "profil_socio_classes.csv"))
+
+################################################################################
+##### 6. MODELISATION ET CONTROLE SECRET STATISTIQUE ###########################
+################################################################################
+
+mod_mn_rci <- multinom(classe ~ SEXE + qualif_classe + niv_dip + age_fin_ctt_redresse + log_sjr, 
+                       data = info_post_rci, trace = FALSE)
+write_csv(broom::tidy(mod_mn_rci, conf.int = TRUE), file.path(dir_res, "multinom_RCI.csv"))
+
+mod_mn_tem <- multinom(classe ~ SEXE + qualif_classe + niv_dip + age_fin_ctt_redresse + log_sjr, 
+                       data = info_post_tem, trace = FALSE)
+write_csv(broom::tidy(mod_mn_tem, conf.int = TRUE), file.path(dir_res, "multinom_TEMOINS.csv"))
+
+# Contrôle du secret statistique (effectifs < 11)
+controle_secret <- profil_classes %>% filter(n < SEUIL_SECRET)
+if (nrow(controle_secret) > 0) {
+  warning("Attention : des cellules sont sous le seuil de secret statistique de 11 !")
+  print(controle_secret)
+} else {
+  cat("\nContrôle du secret statistique : OK (aucune cellule < 11).\n")
+}
+
+################################################################################
+##### 7. EXPORT FINAL ##########################################################
+################################################################################
+
+write_parquet(
+  info_post_final %>% select(id_spell, paire, traite, groupe, classe),
+  file.path(dir_out, "classes_sequences_separees_propre.parquet")
+)
+
+cat("\nTraitement terminé avec succès. Tous les résultats sont dans :", dir_res, "\n")
