@@ -1,15 +1,12 @@
 ################################################################################
 ##### SCRIPT COMPLET : SEQUENCES ET TYPOLOGIES SEPAREES (METHODE SEQHANDBOOK) ##
 ################################################################################
-# Ce script reprend l'intégralité de votre pipeline analytique en l'épurant
-# (suppression des répétitions) et en y intégrant les bonnes pratiques du
-# manuel de Nicolas Robette (TraMineR / WeightedCluster) :
 #   1. Tirage par paires entières
 #   2. Construction et formatage des séquences
 #   3. Typologies séparées (RCI vs Témoins) avec consolidation PAM
 #   4. Description complète (Chronogrammes, Temps moyen, Séquences représentatives, 
 #      Entropie transversale et indicateurs de complexité)
-#   5. Modélisation multinomiale et exports propres
+#   5. Modélisation multinomiale et exports 
 ################################################################################
 
 rm(list = ls())
@@ -26,7 +23,7 @@ dir_out <- "C:/Users/Public/Documents/Salma_CEA/Etude_typeboulle/lt/"
 dir_res <- file.path(dir_out, "resultats_separes_propre")
 if (!dir.exists(dir_res)) dir.create(dir_res, recursive = TRUE)
 
-# --- Fonction utilitaire pour éviter le code répétitif d'export graphique ---
+# --- Fonction utilitaire export graphique ---
 exporter_graphe <- function(nom_fichier, expression_graphique) {
   png(file.path(dir_res, nom_fichier), width = 2400, height = 1600, res = 180)
   eval(substitute(expression_graphique))
@@ -45,8 +42,7 @@ N_PAIRES  <- 5000
 GRAINE    <- 2019
 
 VAR_ANS <- "y_ns_max"
-UTILISER_RETRAITE <- FALSE
-SEUIL_SECRET <- 11
+UTILISER_RETRAITE <- TRUE
 
 apparie <- read_parquet(file.path(dir_out, "echantillon_apparie_2019.parquet")) %>%
   select(id_spell, id_midas, paire, traite, groupe, deb_mois,
@@ -180,7 +176,7 @@ diss_tem <- res_tem$diss
 info_post_final <- bind_rows(info_post_rci, info_post_tem)
 
 ################################################################################
-##### 5. DESCRIPTION COMPLETE DE LA TYPOLOGIE (METHODE SEQHANDBOOK) ############
+##### 5. DESCRIPTION COMPLETE DE LA TYPOLOGIE ##################################
 ################################################################################
 
 decrire_classes <- function(seq_obj, vecteur_classes, diss_matrix, prefixe) {
@@ -242,27 +238,6 @@ profil_classes <- info_post_final %>%
   ungroup()
 
 write_csv(profil_classes, file.path(dir_res, "profil_socio_classes.csv"))
-
-################################################################################
-##### 6. MODELISATION ET CONTROLE SECRET STATISTIQUE ###########################
-################################################################################
-
-mod_mn_rci <- multinom(classe ~ SEXE + qualif_classe + niv_dip + age_fin_ctt_redresse + log_sjr, 
-                       data = info_post_rci, trace = FALSE)
-write_csv(broom::tidy(mod_mn_rci, conf.int = TRUE), file.path(dir_res, "multinom_RCI.csv"))
-
-mod_mn_tem <- multinom(classe ~ SEXE + qualif_classe + niv_dip + age_fin_ctt_redresse + log_sjr, 
-                       data = info_post_tem, trace = FALSE)
-write_csv(broom::tidy(mod_mn_tem, conf.int = TRUE), file.path(dir_res, "multinom_TEMOINS.csv"))
-
-# Contrôle du secret statistique (effectifs < 11)
-controle_secret <- profil_classes %>% filter(n < SEUIL_SECRET)
-if (nrow(controle_secret) > 0) {
-  warning("Attention : des cellules sont sous le seuil de secret statistique de 11 !")
-  print(controle_secret)
-} else {
-  cat("\nContrôle du secret statistique : OK (aucune cellule < 11).\n")
-}
 
 ################################################################################
 ##### 7. EXPORT FINAL ##########################################################
