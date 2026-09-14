@@ -1,0 +1,283 @@
+################################################################################
+##### SCRIPT 3 : DYNAMIC DID & STATISTIQUES DESCRIPTIVES #######################
+##### Version robuste mémoire (v3) - Outcomes étendus & option Trimestres ######
+################################################################################
+
+rm(list = ls()); invisible(gc())
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble); library(stringr)
+  library(DBI); library(duckdb); library(fixest); library(broom); library(writexl)
+})
+
+## ---- Paramètres --------------------------------------------------------------
+dir_out     <- "C:/Users/Public/Documents/Salma_CEA/Etude_typeboulle/lt/"
+dir_tmp     <- "C:/Users/Public/Documents/Salma_CEA/duckdb_temp"
+export_path <- file.path(dir_out, "resultats")
+for (d in c(dir_tmp, export_path)) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+f_panel   <- file.path(dir_out, "panel_pour_appariement_2019.parquet")
+f_apparie <- file.path(dir_out, "echantillon_apparie_2019.parquet")
+db_path   <- file.path(dir_tmp, "did.duckdb")
+
+H_MAX     <- 72     # dernier horizon où toutes les cohortes 2019 sont observées
+H_MIN_ES  <- -24    # event study standard
+H_MIN_CUM <- -1     # event study cumulée
+
+# OPTION ANTI-CRASH : Mettre à TRUE pour grouper les coefficients par TRIMESTRES (divise la RAM par 3)
+REGROUPEMENT_TRIMESTRIEL <- FALSE
+
+REF_H         <- if (REGROUPEMENT_TRIMESTRIEL) -3 else -1
+H_MIN_ES_EFF  <- if (REGROUPEMENT_TRIMESTRIEL) floor(H_MIN_ES / 3) * 3 else H_MIN_ES
+H_MIN_CUM_EFF <- if (REGROUPEMENT_TRIMESTRIEL) floor(H_MIN_CUM / 3) * 3 else H_MIN_CUM
+
+# DuckDB : phase 1 (DuckDB seul) / phase 2 (lecture d'une table étroite)
+DUCK_MEM_BUILD <- "24GB"
+DUCK_MEM_READ  <- "4GB"
+DUCK_THREADS   <- 8
+
+# fixest
+FIXEST_THREADS <- 8
+USE_CALLR      <- requireNamespace("callr", quietly = TRUE)
+if (!USE_CALLR) message("callr non installé : estimations in-process (moins robuste). install.packages('callr')")
+
+H_AS_FE <- FALSE
+SEUIL_ALERTE_GO <- 40
+
+## ---- Outcomes et libellés ----------------------------------------------------
+outcomes_es <- tribble(
+  ~outcome,                     ~libelle,                          ~cumule, ~feuille,
+  "y_salarie",                  "Emploi salarié",                  FALSE,   "Emploi_Salarie",
+  "y_cdi",                      "Emploi en CDI",                   FALSE,   "Emploi_CDI",
+  "y_emploi_durable",           "Emploi durable",                  FALSE,   "Emploi_Durable",
+  "y_formation",                "Présence en formation",           FALSE,   "Formation",
+  "y_ns_min",                   "Emploi non salarié (borne basse)",FALSE,   "NonSalarie_BorneBasse",
+  "y_ns_max",                   "Emploi non salarié (borne haute)",FALSE,   "NonSalarie_BorneHaute",
+  "y_emploi_global_min",        "Emploi global (borne basse)",     FALSE,   "Emploi_Global_Min",
+  "y_emploi_global_max",        "Emploi global (borne haute)",     FALSE,   "Emploi_Global_Max",
+  "f_minima",                   "Présence minima sociaux",         FALSE,   "Minima_Sociaux",
+  "y_acces_emploi",             "Accès à l'emploi salarié",        TRUE,    "Acces_Salarie",
+  "y_acces_emploi_ns",          "Accès à l'emploi non salarié",    TRUE,    "Acces_NonSalarie",
+  "y_acces_emploi_global_min",  "Accès global (borne basse)",      TRUE,    "Acces_Global_Min",
+  "y_acces_emploi_global_max",  "Accès global (borne haute)",      TRUE,    "Acces_Global_Max"
+)
+# f_minima a été retiré d'ici car devenu un outcome principal estimé
+cols_desc_only <- c("indemnise", "y_retraite")   
+
+## ---- Journalisation ----------------------------------------------------------
+t0_global <- Sys.time()
+mem_r <- function() {
+  g <- gc()
+  sprintf("R utilise %.1f Go, pic depuis dernière étape %.1f Go", sum(g[, 2]) / 1024, sum(g[, 6]) / 1024)
+}
+etape  <- function(tag, ...) message(sprintf("%s %s  [%s]", tag, paste0(...), format(Sys.time(), "%H:%M:%S")))
+chrono <- function(label, expr) {
+  invisible(gc(reset = TRUE)); t0 <- Sys.time()
+  res <- force(expr)
+  message(sprintf("    -> %s : %.1f min | %s", label, as.numeric(difftime(Sys.time(), t0, units = "mins")), mem_r()))
+  res
+}
+q <- function(x) gsub("'", "''", x)
+
+################################################################################
+# PHASE 1 : DUCKDB SEUL - JOINTURE, TABLE D'ANALYSE, DESCRIPTIFS
+################################################################################
+
+construire_base <- function() {
+  unlink(c(db_path, paste0(db_path, ".wal")))
+  con <- dbConnect(duckdb::duckdb(), dbdir = db_path)
+  on.exit({ if (dbIsValid(con)) dbDisconnect(con, shutdown = TRUE) }, add = TRUE)
+
+  dbExecute(con, sprintf("SET temp_directory = '%s';", q(dir_tmp)))
+  dbExecute(con, sprintf("SET memory_limit = '%s';", DUCK_MEM_BUILD))
+  dbExecute(con, sprintf("SET threads = %d;", DUCK_THREADS))
+  dbExecute(con, "SET preserve_insertion_order = false;")
+  etape("[1/5]", "Connexion DuckDB : limit=", DUCK_MEM_BUILD, ", threads=", DUCK_THREADS)
+
+  cols_p <- dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet('%s')", q(f_panel)))$column_name
+  cols_a <- dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet('%s')", q(f_apparie)))$column_name
+  src <- function(col) {
+    if (col %in% cols_p) return(paste0("p.", col))
+    if (col %in% cols_a) return(paste0("a.", col))
+    stop("Colonne '", col, "' introuvable dans les Parquet.")
+  }
+  
+  cols_y <- c(outcomes_es$outcome, cols_desc_only)
+  sel_y  <- paste(sprintf("CAST(%s AS DOUBLE) AS %s", vapply(cols_y, src, ""), cols_y), collapse = ",\n      ")
+
+  sql_h <- if (REGROUPEMENT_TRIMESTRIEL) "FLOOR(p.h / 3.0) * 3" else "p.h"
+
+  sql_ctas <- sprintf("
+    CREATE TABLE panel_es AS
+    WITH
+      a AS (
+        SELECT id_spell, traite, paire%s
+        FROM read_parquet('%s')
+      ),
+      dim_spell AS (
+        SELECT id_spell, CAST(ROW_NUMBER() OVER (ORDER BY id_spell) AS INTEGER) AS id_spell_i
+        FROM (SELECT DISTINCT id_spell FROM a)
+      ),
+      dim_paire AS (
+        SELECT paire, CAST(ROW_NUMBER() OVER (ORDER BY paire) AS INTEGER) AS paire_i
+        FROM (SELECT DISTINCT paire FROM a)
+      ),
+      dim_deb AS (
+        SELECT deb_mois, CAST(ROW_NUMBER() OVER (ORDER BY deb_mois) AS INTEGER) AS deb_mois_i
+        FROM (SELECT DISTINCT deb_mois FROM read_parquet('%s') WHERE h <= %d)
+      )
+    SELECT
+      ds.id_spell_i             AS id_spell,
+      dd.deb_mois_i             AS deb_mois,
+      CAST(%s AS INTEGER)       AS h,
+      CAST(a.traite AS INTEGER) AS traite,
+      dp.paire_i                AS paire,
+      %s
+    FROM read_parquet('%s') p
+    JOIN a         ON a.id_spell  = p.id_spell
+    JOIN dim_spell ds ON ds.id_spell = p.id_spell
+    JOIN dim_paire dp ON dp.paire    = a.paire
+    JOIN dim_deb   dd ON dd.deb_mois = p.deb_mois
+    WHERE p.h <= %d;",
+    { extra <- cols_desc_only[cols_desc_only %in% cols_a & !cols_desc_only %in% cols_p]
+      if (length(extra)) paste0(", ", paste(extra, collapse = ", ")) else "" },
+    q(f_apparie), q(f_panel), H_MAX, sql_h, sel_y, q(f_panel), H_MAX)
+
+  etape("[2/5]", "Construction table d'analyse panel_es (Bin Trimestriel: ", REGROUPEMENT_TRIMESTRIEL, ")")
+  chrono("CREATE TABLE panel_es", dbExecute(con, sql_ctas))
+  dbExecute(con, "CHECKPOINT;")
+
+  ctrl <- dbGetQuery(con, sprintf("
+    SELECT COUNT(*)                                     AS n_lignes,
+           COUNT(DISTINCT id_spell)                     AS n_spells,
+           COUNT(DISTINCT h)                            AS n_h,
+           SUM(CASE WHEN h >= %d THEN 1 ELSE 0 END)     AS n_lignes_es,
+           SUM(CASE WHEN h >= %d THEN 1 ELSE 0 END)     AS n_lignes_cum
+    FROM panel_es", H_MIN_ES_EFF, H_MIN_CUM_EFF))
+  
+  etape("[3/5]", "Statistiques descriptives")
+  stats_descriptives <- chrono("Descriptifs SQL", dbGetQuery(con, "
+    SELECT h, traite, COUNT(*) AS n,
+           AVG(y_salarie)          AS taux_salarie,
+           AVG(y_cdi)              AS taux_cdi,
+           AVG(y_emploi_durable)   AS taux_emploi_durable,
+           AVG(y_emploi_global_min) AS taux_emploi_global_min,
+           AVG(y_emploi_global_max) AS taux_emploi_global_max,
+           AVG(y_formation)        AS taux_formation,
+           AVG(y_ns_min)           AS taux_ns_min,
+           AVG(y_ns_max)           AS taux_ns_max,
+           AVG(indemnise)          AS taux_indemnise,
+           AVG(f_minima)           AS taux_minima,
+           AVG(y_retraite)         AS taux_retraite,
+           AVG(y_acces_emploi_ns)  AS taux_acces_ns
+    FROM panel_es
+    GROUP BY h, traite
+    ORDER BY h, traite")) %>%
+    as_tibble() %>%
+    mutate(groupe_nom = if_else(traite == 1, "RCI", "Temoins"))
+
+  stats_desc_excel <- stats_descriptives %>%
+    select(-traite) %>%
+    pivot_wider(names_from = groupe_nom, values_from = c(-h, -groupe_nom), names_glue = "{.value}_{groupe_nom}") %>%
+    arrange(h)
+
+  list(stats_desc_excel = stats_desc_excel, ctrl = ctrl)
+}
+
+################################################################################
+# PHASE 2 : FIXEST ISOLÉ - UN OUTCOME PAR PROCESSUS
+################################################################################
+
+worker_estimation <- function(outcome, libelle, cumule, h_min, db_path,
+                              mem_limit, threads_duck, threads_fixest, h_as_fe, ref_h) {
+  suppressPackageStartupMessages({
+    library(DBI); library(duckdb); library(fixest); library(broom)
+    library(dplyr); library(stringr); library(tibble)
+  })
+  journal <- character(0); note <- function(...) journal <<- c(journal, sprintf(...))
+  t0 <- Sys.time()
+
+  con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = TRUE)
+  on.exit({ if (dbIsValid(con)) dbDisconnect(con, shutdown = TRUE) }, add = TRUE)
+  dbExecute(con, sprintf("SET memory_limit = '%s';", mem_limit))
+  dbExecute(con, sprintf("SET threads = %d;", threads_duck))
+  
+  d <- dbGetQuery(con, sprintf(
+    "SELECT id_spell, deb_mois, h, traite, paire, %s
+     FROM panel_es WHERE h >= %d AND %s IS NOT NULL", outcome, h_min, outcome))
+  dbDisconnect(con, shutdown = TRUE)
+
+  fe <- if (cumule) "paire + deb_mois" else "id_spell + deb_mois"
+  f  <- if (h_as_fe) {
+    as.formula(paste0(outcome, " ~ i(h, traite, ref = ", ref_h, ") | ", fe, " + h"))
+  } else {
+    as.formula(paste0(outcome, " ~ i(h, ref = ", ref_h, ") + i(h, traite, ref = ", ref_h, ") | ", fe))
+  }
+  
+  setFixest_nthreads(threads_fixest)
+  m <- feols(f, data = d, cluster = ~id_spell, mem.clean = TRUE, lean = TRUE)
+  rm(d)
+
+  df_coefs <- tidy(m, conf.int = TRUE) %>%
+    filter(str_detect(term, "traite")) %>%
+    mutate(h = as.numeric(str_extract(term, "-?\\d+")), outcome = libelle) %>%
+    select(outcome, h, estimate, conf.low, conf.high, p.value)
+    
+  res <- bind_rows(df_coefs,
+                   tibble(outcome = libelle, h = ref_h,
+                          estimate = 0, conf.low = 0, conf.high = 0, p.value = NA_real_)) %>%
+    arrange(h)
+  
+  list(res = res, journal = journal)
+}
+
+estimer_outcome <- function(outcome, libelle, cumule) {
+  etape("[4/5]", "Estimation : ", libelle)
+  
+  h_min_eff <- if (cumule) H_MIN_CUM_EFF else H_MIN_ES_EFF
+  args <- list(outcome = outcome, libelle = libelle, cumule = cumule,
+               h_min = h_min_eff, db_path = db_path,
+               mem_limit = DUCK_MEM_READ, threads_duck = DUCK_THREADS,
+               threads_fixest = FIXEST_THREADS, h_as_fe = H_AS_FE, ref_h = REF_H)
+               
+  out <- tryCatch({
+    if (USE_CALLR) callr::r(worker_estimation, args = args, package = FALSE)
+    else           do.call(worker_estimation, args)
+  }, error = function(e) {
+    message("    !!! ECHEC pour '", libelle, "' : ", conditionMessage(e))
+    NULL
+  })
+  if (!is.null(out)) { for (l in out$journal) message(l); return(out$res) }
+  NULL
+}
+
+################################################################################
+# EXÉCUTION
+################################################################################
+
+main <- function() {
+  base <- construire_base()
+  invisible(gc())
+
+  resultats <- vector("list", nrow(outcomes_es)); names(resultats) <- outcomes_es$feuille
+  for (i in seq_len(nrow(outcomes_es))) {
+    resultats[[i]] <- estimer_outcome(outcomes_es$outcome[i], outcomes_es$libelle[i], outcomes_es$cumule[i])
+  }
+  
+  ok <- !vapply(resultats, is.null, logical(1))
+  resultats_finaux <- bind_rows(resultats[ok])
+
+  etape("[5/5]", "Export Excel")
+  feuilles <- c(list("Statistiques_Brutes" = base$stats_desc_excel,
+                     "Tous_les_resultats_DiD" = resultats_finaux),
+                resultats[ok])
+  write_xlsx(feuilles, path = file.path(export_path, "Resultat_Event_Study_RCI_2019.xlsx"))
+  
+  message(sprintf("Terminé en %.1f min | %s",
+                  as.numeric(difftime(Sys.time(), t0_global, units = "mins")), mem_r()))
+}
+
+sortie <- tryCatch(main(), error = function(e) {
+  message("ERREUR FATALE : ", conditionMessage(e))
+  stop(e)
+})
