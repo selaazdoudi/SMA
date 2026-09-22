@@ -1,0 +1,121 @@
+################################################################################
+##### EVENT STUDY RCI 2022 - GRAPHIQUES STYLE DARES (Figure 10, p. 39) #########
+################################################################################
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+
+# --- 0. Parametres ------------------------------------------------------------
+fichier_xlsx <- "Resultat_Event_Study_RCI_2022.xlsx"      # chemin vers vos resultats
+dir_fig      <- "figures_event_study"
+if (!dir.exists(dir_fig)) dir.create(dir_fig, recursive = TRUE)
+
+H_REF <- -1
+LAB_X <- "Temps depuis la fin du contrat (ref = -1)"
+
+# --- 1. Theme commun (style des figures du Document d'etudes) -------------------
+theme_dares <- theme_minimal(base_size = 10) +
+  theme(plot.background  = element_rect(fill = "white", colour = NA),
+        panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
+        panel.grid.minor = element_line(colour = "grey95", linewidth = 0.3),
+        axis.text        = element_text(colour = "grey40", size = 7),
+        axis.title       = element_text(colour = "black", size = 8),
+        strip.text       = element_text(face = "bold", size = 8, hjust = 0),
+        legend.title     = element_text(size = 8),
+        legend.text      = element_text(size = 7))
+
+breaks_h <- seq(-25, 40, 5)
+
+# --- 2. Coefficients d'event study ---------------------------------------------
+coefs <- read_excel(fichier_xlsx, sheet = "Tous_les_resultats_DiD") %>%
+  mutate(acces = str_detect(outcome, "^Accès")) %>%
+  filter(h != H_REF, h != 0, !(acces & h < 0)) %>%       # ref. et h = 0 omis ; accès : h > 0
+  mutate(outcome = factor(outcome, levels = unique(outcome)))
+
+plot_es <- function(d) {
+  # ligne verticale de reference seulement pour les outcomes hors "Accès"
+  vline_df <- d %>% distinct(outcome, acces) %>% filter(!acces) %>% mutate(x_ref = H_REF)
+  lab_x    <- if (all(d$acces)) "Temps depuis la fin du contrat" else LAB_X
+  ggplot(d, aes(x = h, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    geom_vline(data = vline_df, aes(xintercept = x_ref),
+               linetype = "dashed", linewidth = 0.4) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.4, linewidth = 0.35) +
+    geom_point(size = 1.1) +
+    scale_x_continuous(breaks = breaks_h) +
+    labs(x = lab_x, y = "Effet estimé") +
+    theme_dares
+}
+
+nom_fichier <- function(x) {
+  x %>% stringi::stri_trans_general("Latin-ASCII") %>% str_to_lower() %>%
+    str_replace_all("[^a-z0-9]+", "_") %>% str_remove_all("^_|_$")
+}
+
+# Un graphique par outcome (liste nommee : graphs_es[["Emploi salarié"]])
+graphs_es <- coefs %>%
+  split(.$outcome, drop = TRUE) %>%
+  map(plot_es)
+
+iwalk(graphs_es, function(g, nom) {
+  print(g)                                                # affichage un par un
+  ggsave(file.path(dir_fig, paste0("es_", nom_fichier(nom), ".png")),
+         g, width = 5.5, height = 5.5, dpi = 300)
+})
+
+# --- 3. Trajectoires brutes (style Figures 3 a 9) ------------------------------
+libelles_taux <- c(
+  taux_salarie            = "Emploi salarié",
+  taux_cdi                = "Emploi en CDI",
+  taux_emploi_durable     = "Emploi durable",
+  taux_emploi_global_min  = "Emploi global (borne basse)",
+  taux_emploi_global_max  = "Emploi global (borne haute)",
+  taux_ns_min             = "Emploi non salarié (borne basse)",
+  taux_ns_max             = "Emploi non salarié (borne haute)",
+  taux_indemnise          = "Indemnisation chômage",
+  taux_retraite           = "Retraite",
+  taux_acces_ns           = "Accès à l'emploi non salarié")
+
+brutes <- read_excel(fichier_xlsx, sheet = "Statistiques_Brutes") %>%
+  select(h, starts_with("taux_")) %>%
+  pivot_longer(-h, names_to = c("indic", "groupe"),
+               names_pattern = "(taux_.*)_(Temoins|RCI)$") %>%
+  mutate(indic  = factor(libelles_taux[indic], levels = libelles_taux),
+         groupe = recode(groupe, Temoins = "Groupe de contrôle", RCI = "RCI")) %>%
+  filter(!(str_detect(indic, "^Accès") & h < 0))          # accès à partir de 0
+
+plot_brut <- function(d) {
+  ggplot(d, aes(x = h, y = value, colour = groupe)) +
+    geom_line(linewidth = 0.7) +
+    scale_colour_manual(values = c("Groupe de contrôle" = "royalblue",
+                                   "RCI"                = "#F8766D"),
+                        name = "Groupe") +
+    scale_x_continuous(breaks = breaks_h) +
+    labs(x = "Temps depuis la fin du contrat", y = "Proportion") +
+    theme_dares
+}
+
+# Un graphique par indicateur (liste nommee : graphs_brut[["Emploi salarié"]])
+graphs_brut <- brutes %>%
+  split(.$indic, drop = TRUE) %>%
+  map(plot_brut)
+
+iwalk(graphs_brut, function(g, nom) {
+  print(g)
+  ggsave(file.path(dir_fig, paste0("brut_", nom_fichier(nom), ".png")),
+         g, width = 6.5, height = 5, dpi = 300)
+})
+
+# --- 4. Planches en facettes (a la fin) ------------------------------------------
+g_es_all <- plot_es(coefs) + facet_wrap(~ outcome, ncol = 3, scales = "free")
+ggsave(file.path(dir_fig, "es_tous_outcomes.png"), g_es_all,
+       width = 11, height = 12, dpi = 300)
+
+g_brut_all <- plot_brut(brutes) +
+  facet_wrap(~ indic, ncol = 3, scales = "free") +
+  theme(legend.position = "bottom")
+ggsave(file.path(dir_fig, "brut_tous_indicateurs.png"), g_brut_all,
+       width = 11, height = 12, dpi = 300)
