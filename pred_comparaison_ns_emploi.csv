@@ -1,0 +1,7 @@
+indicateur,valeur
+"Emploi salarie predit, classe non-salariat",0.5571987407029411
+"Emploi salarie predit, classe emploi salarie",0.5580843971141318
+Ecart (non-salariat - emploi salarie),-8.856564111907606e-4
+Ecart standardise,-0.009079964325468233
+"Emploi total observe, classe non-salariat",0.913667475816681
+"Emploi total observe, classe emploi salarie",0.732566536629685
